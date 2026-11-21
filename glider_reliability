@@ -1,0 +1,161 @@
+"""Reliability comparison for the 720-ft GPOPS-II glider trajectory.
+
+"""
+import argparse,csv,json,time
+from pathlib import Path
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
+from scipy.special import logsumexp,ndtr
+
+HERE=Path(__file__).resolve().parent
+MEAN,SD=.00873,.002
+RHO,K,G,M,S=.002378,.045,32.2,5.6,45.09703
+A=RHO*S/(2*M)
+LOG2PI=np.log(2*np.pi)
+
+
+def critical_coefficient(path):
+    data=np.loadtxt(path,delimiter=',');t=data[:,0];state0=data[0,1:7]
+    controls=data[:,7:9];beta=.0637365185
+    def maximum_height(cd):
+        def rhs(tt,s):
+            cl=np.interp(tt,t,controls[:,0]);phi=np.interp(tt,t,controls[:,1])
+            x,y,h,v,gamma,psi=s
+            sg,cg,sp,cp=np.sin(gamma),np.cos(gamma),np.sin(psi),np.cos(psi)
+            dw=beta*v*sg
+            return [v*cg*sp+beta*h,v*cg*cp,v*sg,
+                -A*(cd+K*cl*cl)*v*v-G*sg-dw*sp*cg,
+                A*cl*v*np.cos(phi)-G*cg/v+dw*sp*sg/v,
+                (A*cl*v*np.sin(phi)-dw*cp/v)/cg]
+        sol=solve_ivp(rhs,(t[0],t[-1]),state0,dense_output=True,rtol=1e-8,atol=1e-10)
+        if not sol.success:raise RuntimeError(sol.message)
+        return float(np.max(sol.sol(np.linspace(t[0],t[-1],2001))[2]))
+    xs=np.linspace(MEAN-4*SD,MEAN+4*SD,33)
+    ys=[maximum_height(x) for x in xs]
+    if not np.all(np.diff(ys)<0):raise RuntimeError('Altitude response is not monotone on checked range')
+    root=brentq(lambda x:maximum_height(x)-720,MEAN-2*SD,MEAN+2*SD,xtol=1e-13)
+    return root,(root-MEAN)/SD
+
+
+def lognormal(z,mean=0.,sd=1.):
+    return -.5*((z-mean)/sd)**2-np.log(sd)-.5*LOG2PI
+
+
+class Proposal:
+    def __init__(self,weights,means,sds):
+        self.weights=np.asarray(weights)/sum(weights)
+        self.means=np.asarray(means);self.sds=np.asarray(sds)
+    def sample(self,rng,n):
+        k=rng.choice(len(self.weights),n,p=self.weights)
+        return rng.normal(self.means[k],self.sds[k])
+    def logpdf(self,z):
+        return logsumexp(np.log(self.weights)[None,:]+lognormal(np.asarray(z)[:,None],self.means[None,:],self.sds[None,:]),axis=1)
+    def defensive(self,weight=.05):
+        return Proposal(np.r_[(1-weight)*self.weights,weight],np.r_[self.means,0.],np.r_[self.sds,1.])
+
+
+def failure_chain(rng,zcrit,steps=8000,scale=.65):
+    pool=rng.normal(size=2000);fail=pool[pool<zcrit]
+    if len(fail)==0:raise RuntimeError('No failure seed')
+    z=rng.choice(fail);chain=[]
+    for _ in range(steps):
+        q=z+rng.normal(scale=scale)
+        if q<zcrit and np.log(rng.random())<min(0.,-.5*(q*q-z*z)):z=q
+        chain.append(z)
+    return np.asarray(chain)[steps//5:]
+
+
+def fit_gmm2(chain,rng):
+    means=np.quantile(chain,[.3,.7]);sds=np.full(2,max(.2,np.std(chain)/2))
+    weights=np.array([.5,.5])
+    for _ in range(150):
+        logp=np.log(weights)[None,:]+lognormal(chain[:,None],means[None,:],sds[None,:])
+        r=np.exp(logp-logsumexp(logp,axis=1)[:,None]);mass=r.sum(axis=0)
+        newmeans=(r*chain[:,None]).sum(axis=0)/mass
+        newsds=np.sqrt(np.maximum(.03,(r*(chain[:,None]-newmeans)**2).sum(axis=0)/mass))
+        if np.max(abs(newmeans-means))<1e-7:break
+        weights=mass/len(chain);means=newmeans;sds=newsds
+    return Proposal(weights,means,sds)
+
+
+def run_is(name,chain,rng,zcrit,batch,tol,cov_target,max_iterations=1000):
+    start=time.process_time()
+    if name=='MIS':
+        means=chain[np.linspace(0,len(chain)-1,200,dtype=int)]
+        proposal=Proposal(np.ones(200)/200,means,np.full(200,.65))
+        training=0
+    elif name=='CE-IS':
+        mean,sd=np.mean(chain),max(.2,np.std(chain))
+        for _ in range(4):
+            z=rng.normal(mean,sd,2000)
+            elite=z[z<zcrit]
+            if len(elite)>20:mean,sd=np.mean(elite),max(.2,np.std(elite))
+        proposal=Proposal([1.],[mean],[sd]);training=8000
+    else:
+        proposal=fit_gmm2(chain,rng);training=0
+    proposal=proposal.defensive(.05)
+    total=total_sq=0.;previous=None;consecutive=0
+    for iteration in range(1,max_iterations+1):
+        z=proposal.sample(rng,batch)
+        values=np.exp(lognormal(z)-proposal.logpdf(z))*(z<zcrit)
+        total+=values.sum();total_sq+=values@values
+        n=iteration*batch;pf=total/n
+        var=max(0.,(total_sq-total*total/n)/(n-1));se=np.sqrt(var/n)
+        change=np.inf if previous is None else abs(pf-previous)/max(previous,1e-15)
+        consecutive=consecutive+1 if change<tol and se/pf<=cov_target and iteration>=5 else 0
+        previous=pf
+        if consecutive>=2:break
+    return {'method':name,'pf':float(pf),'standard_error':float(se),'estimator_cov':float(se/pf),
+            'n_estimation':n,'n_training':training,'cpu_seconds':time.process_time()-start,
+            'converged':consecutive>=2}
+
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--trajectory',type=Path,default=HERE/'glider_gpops_720_results'/'trajectory_ft.csv')
+    parser.add_argument('--output',type=Path,default=HERE/'glider_reliability_results')
+    parser.add_argument('--repeats',type=int,default=5)
+    parser.add_argument('--mcs-samples',type=int,default=3000000)
+    parser.add_argument('--is-batch-size',type=int,default=5000)
+    parser.add_argument('--relative-tolerance',type=float,default=1e-4)
+    parser.add_argument('--target-cov',type=float,default=.0006)
+    parser.add_argument('--seed',type=int,default=20261117)
+    args=parser.parse_args()
+    critical,zcrit=critical_coefficient(args.trajectory)
+    exact=float(ndtr(zcrit))
+    args.output.mkdir(parents=True,exist_ok=True)
+    print(f'critical CD0={critical:.11f}, exact reference Pf={exact:.8f}',flush=True)
+    rows=[]
+    for rep,seed in enumerate(np.random.SeedSequence(args.seed).spawn(args.repeats),1):
+        seeds=seed.spawn(5)
+        rng=np.random.default_rng(seeds[0]);start=time.process_time()
+        mcs_z=rng.normal(size=args.mcs_samples);pf=float(np.mean(mcs_z<zcrit))
+        rows.append({'repeat':rep,'method':'MCS','pf':pf,'standard_error':float(np.sqrt(pf*(1-pf)/args.mcs_samples)),
+                     'estimator_cov':float(np.sqrt(pf*(1-pf)/args.mcs_samples)/pf),
+                     'n_estimation':args.mcs_samples,'n_training':0,'cpu_seconds':time.process_time()-start,'converged':True})
+        chain=failure_chain(np.random.default_rng(seeds[1]),zcrit)
+        for idx,name in enumerate(('MIS','CE-IS','MG-IS'),2):
+            result=run_is(name,chain,np.random.default_rng(seeds[idx]),zcrit,args.is_batch_size,
+                             args.relative_tolerance,args.target_cov)
+            rows.append({'repeat':rep,**result})
+            print(rep,name,result['pf'],result['n_estimation'],result['cpu_seconds'],flush=True)
+    with (args.output/'all_runs.csv').open('w',newline='',encoding='utf-8-sig') as f:
+        w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+    summary=[]
+    for name in ('MCS','MIS','CE-IS','MG-IS'):
+        group=[r for r in rows if r['method']==name]
+        summary.append({'method':name,'mean_pf':float(np.mean([r['pf'] for r in group])),
+                        'mean_abs_error_vs_exact':float(np.mean([abs(r['pf']-exact) for r in group])),
+                        'mean_samples':float(np.mean([r['n_estimation'] for r in group])),
+                        'mean_cpu_seconds':float(np.mean([r['cpu_seconds'] for r in group])),
+                        'converged_runs':sum(r['converged'] for r in group)})
+    with (args.output/'summary.csv').open('w',newline='',encoding='utf-8-sig') as f:
+        w=csv.DictWriter(f,fieldnames=list(summary[0]));w.writeheader();w.writerows(summary)
+    (args.output/'config.json').write_text(json.dumps({'critical_cd0':critical,'zcrit':zcrit,
+        'exact_reference_pf':exact,'config':{k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()},
+        'note':'MCS and IS use the same threshold evaluator; ODE threshold construction excluded from all method timings.'},indent=2),encoding='utf-8')
+    print(summary,flush=True)
+
+
+if __name__=='__main__':main()

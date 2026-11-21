@@ -1,0 +1,92 @@
+import argparse
+from pathlib import Path
+import numpy as np
+from scipy.optimize import minimize
+
+HERE = Path(__file__).resolve().parent
+START = np.array([0., 2., 0.])
+END = np.array([8., 8., 8.])
+
+
+def matrices(tf, n, times):
+    edges = np.linspace(0, tf, n + 1)
+    h = tf / n
+    t = np.asarray(times)[:, None]
+    a = np.clip(t - edges[:-1], 0, h)
+    b = (np.maximum(t - edges[:-1], 0)**2 - np.maximum(t - edges[1:], 0)**2) / 2
+    return a, b
+
+
+def solve(tf=10., n=40, design_radius=2.):
+    times = np.linspace(0, tf, 5*n + 1)
+    a, b = matrices(tf, n, times)
+    endpoint_a, endpoint_b = matrices(tf, n, [tf])
+    dt = tf/n
+    target = END - START
+    bounds = [(None, None)] * (3*n)
+    candidates = []
+    for side in (-1., 1.):
+        s = times/tf
+        path = START + (3*s*s-2*s*s*s)[:, None]*target
+        path[:, 1] += side*2.3*np.sin(np.pi*s)**2
+        v = np.gradient(path, times, axis=0)
+        u0 = np.gradient(v, times, axis=0)[::5][:n].reshape(-1)
+
+        def unpack(z): return z.reshape(n, 3)
+        def position(z): return START + b @ unpack(z)
+        def objective(z): return dt*np.dot(z, z)
+        def objective_jac(z): return 2*dt*z
+        def eq(z):
+            u = unpack(z)
+            return np.r_[(endpoint_b @ u - target).ravel(), (endpoint_a @ u).ravel()]
+        def eq_jac(z):
+            out = np.zeros((6, 3*n))
+            for j in range(3):
+                out[j, j::3] = endpoint_b[0]
+                out[j+3, j::3] = endpoint_a[0]
+            return out
+        def ineq(z):
+            p = position(z)
+            obstacle = (p[:, 0]-4)**2+(p[:, 1]-5)**2-design_radius**2-0.002
+            return np.r_[obstacle, p.ravel(), (10-p).ravel()]
+        def ineq_jac(z):
+            p = position(z)
+            m = len(times)
+            dpos = np.zeros((3*m, 3*n))
+            for j in range(3):
+                dpos[j::3,j::3] = b
+            dobs = 2*(p[:,0]-4)[:,None]*dpos[0::3] + 2*(p[:,1]-5)[:,None]*dpos[1::3]
+            return np.vstack((dobs,dpos,-dpos))
+        result = minimize(objective, u0, jac=objective_jac, method='SLSQP', bounds=bounds,
+                          constraints=[{'type':'eq','fun':eq,'jac':eq_jac},
+                                       {'type':'ineq','fun':ineq,'jac':ineq_jac}],
+                          options={'maxiter':800,'ftol':1e-9})
+        print('side',side,'status',result.message,'min_ineq',np.min(ineq(result.x)),
+              'max_eq',np.max(np.abs(eq(result.x))),flush=True)
+        if np.min(ineq(result.x)) >= -1e-5 and np.max(np.abs(eq(result.x))) < 1e-5:
+            candidates.append(result)
+    if not candidates:
+        raise RuntimeError('No feasible trajectory; try a different tf or discretization')
+    best = min(candidates, key=lambda r:r.fun)
+    dense_t = np.linspace(0, tf, 2001)
+    aa, bb = matrices(tf, n, dense_t)
+    u = unpack(best.x)
+    p = START + bb @ u
+    v = aa @ u
+    margin = (p[:, 0]-4)**2+(p[:, 1]-5)**2-4
+    return {'time':dense_t, 'position':p, 'velocity':v, 'controls':u,
+            'tf':tf, 'design_radius':design_radius, 'objective':best.fun,
+            'min_obstacle_margin':float(margin.min())}
+
+
+if __name__ == '__main__':
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--tf',type=float,default=10.)
+    parser.add_argument('--intervals',type=int,default=40)
+    parser.add_argument('--design-radius',type=float,default=2.)
+    parser.add_argument('--output',type=Path,default=HERE/'aircraft_deterministic_trajectory.npz')
+    args=parser.parse_args()
+    r=solve(args.tf,args.intervals,args.design_radius)
+    args.output.parent.mkdir(parents=True,exist_ok=True)
+    np.savez(args.output,**r)
+    print(f"J={r['objective']:.9f}; minimum obstacle margin={r['min_obstacle_margin']:.8f}; saved {args.output}")

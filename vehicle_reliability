@@ -1,0 +1,492 @@
+import argparse
+import csv
+import hashlib
+import json
+import time
+from pathlib import Path
+import numpy as np
+from scipy.special import betaincinv, ndtr, logsumexp
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+HERE = Path(__file__).resolve().parent
+CENTER = np.array([1.4, 1.5])
+PHYSICAL_RADIUS = 1.0
+LOG2PI = np.log(2 * np.pi)
+UNCERTAINTY_DESCRIPTION = "independent dx,dy = -0.1 + 0.2 Beta(2,4)"
+FAILURE_EVENT_DESCRIPTION = "min saved-node squared clearance < 0"
+
+
+class FailureModel:
+    def __init__(self, path):
+        with np.load(path, allow_pickle=False) as saved:
+            self.time = saved["time"].copy()
+            self.position = saved["position"].copy()
+        if (self.position.shape != (len(self.time), 2)
+                or not np.all(np.isfinite(self.position))
+                or not np.all(np.diff(self.time) > 0)):
+            raise ValueError("轨迹需要递增的time和有限的(N,2) position")
+        self.relative = self.position - CENTER
+        self.squared = np.sum(self.relative**2, axis=1)
+        self.evaluations = 0
+
+    def margin(self, offsets):
+        """分批求所有保存节点上的最小裕度，避免N_samples*N_time内存暴涨。"""
+        offsets = np.atleast_2d(offsets)
+        self.evaluations += len(offsets)
+        result = np.empty(len(offsets))
+        for first in range(0, len(offsets), 1024):
+            d = offsets[first:first + 1024]
+            squared = (self.squared[None, :] + 2 * (d @ self.relative.T)
+                       + np.sum(d*d, axis=1)[:, None] - 1.0)
+            result[first:first + len(d)] = squared.min(axis=1)
+        return result
+
+    def latent_margin(self, z):
+        return self.margin(to_offset(z))
+
+def to_offset(z):
+    return -0.1 + 0.2 * betaincinv(2.0, 4.0, ndtr(np.asarray(z)))
+
+def log_target(z):
+    return -LOG2PI - 0.5 * np.sum(np.asarray(z)**2, axis=1)
+
+def regularize(cov):
+    eigenvalues, eigenvectors = np.linalg.eigh((cov + cov.T) / 2)
+    return (eigenvectors * np.maximum(eigenvalues, 1e-4)) @ eigenvectors.T
+
+class Mixture:
+    def __init__(self, weights, means, covariances):
+        self.weights = np.asarray(weights, dtype=float)
+        self.weights /= self.weights.sum()
+        self.means = np.asarray(means)
+        self.covariances = np.array([regularize(c) for c in covariances])
+        self.inverse = np.linalg.inv(self.covariances)
+        self.logdet = np.linalg.slogdet(self.covariances)[1]
+
+    def component_logpdf(self, z):
+        delta = np.asarray(z)[:, None, :] - self.means[None, :, :]
+        quad = np.einsum("nki,kij,nkj->nk", delta, self.inverse, delta)
+        return -LOG2PI - 0.5 * (self.logdet[None, :] + quad)
+
+    def logpdf(self, z):
+        output = np.empty(len(z))
+        for first in range(0, len(z), 2048):
+            batch = z[first:first + 2048]
+            output[first:first + len(batch)] = logsumexp(
+                self.component_logpdf(batch) + np.log(self.weights), axis=1)
+        return output
+
+    def sample(self, rng, n):
+        indices = rng.choice(len(self.weights), n, p=self.weights)
+        result = np.empty((n, 2))
+        for k in np.unique(indices):
+            mask = indices == k
+            result[mask] = rng.multivariate_normal(self.means[k], self.covariances[k], mask.sum())
+        return result
+
+    def defensive(self, weight):
+        if weight == 0:
+            return self
+        return Mixture(np.r_[(1-weight)*self.weights, weight],
+                       np.vstack([self.means, np.zeros(2)]),
+                       np.concatenate([self.covariances, np.eye(2)[None, :, :]]))
+
+
+def chain_diagnostics(chain):
+    output = {}
+    for j in range(2):
+        x = chain[:, j] - chain[:, j].mean()
+        n = len(x)
+        f = np.fft.rfft(x, n=2*n)
+        ac = np.fft.irfft(f * f.conjugate())[:n]
+        if ac[0] <= 0:
+            rho, ess = 1.0, 1.0
+        else:
+            ac /= ac[0]
+            total = 0.0
+            for lag in range(1, min(n-1, 1000), 2):
+                pair = ac[lag] + ac[lag+1]
+                if pair <= 0:
+                    break
+                total += pair
+            rho, ess = float(ac[1]), float(min(n, n / max(1.0, 1+2*total)))
+        output[f"lag1_z{j+1}"] = rho
+        output[f"approx_ess_z{j+1}"] = ess
+    return output
+
+
+def failure_chain(model, rng, steps, scale):
+    """单链MH，目标为phi(z)*I[g(z)<0]；拒绝时保留并记录当前状态。"""
+    for seed_batch in range(10):
+        pool = rng.standard_normal((2000, 2))
+        found = np.flatnonzero(model.latent_margin(pool) < 0)
+        if len(found):
+            current = pool[rng.choice(found)].copy()
+            break
+    else:
+        raise RuntimeError("连续10批、每批2000个初始样本均未找到失效点；不把这解释为Pf=0。")
+    chain = np.empty((steps, 2))
+    accepted = 0
+    for i in range(steps):
+        proposal = current + scale * rng.standard_normal(2)
+        g = model.latent_margin(proposal[None, :])[0]
+        if g < 0 and np.log(rng.random()) < min(0.0, -0.5*(proposal@proposal-current@current)):
+            current = proposal
+            accepted += 1
+        chain[i] = current
+    burn = int(steps * 0.2)
+    retained = chain[burn:]
+    diagnostics = {"seed_samples": (seed_batch+1)*2000, "burn_in": burn,
+                   "chain_steps": steps, "retained_chain_samples": len(retained),
+                   "acceptance_rate": accepted/steps,
+                   **chain_diagnostics(retained)}
+    return retained, diagnostics
+
+
+def fit_two_component_gmm(samples, rng):
+    """标准EM：固定两个全协方差分量、两次随机初始化。
+
+    均值对数似然变化小于1e-5时停止；不执行BIC模型选择。
+    """
+    choices = []
+    records = []
+    base_cov = regularize(np.cov(samples.T))
+    for k in (2,):
+        for restart in range(2):
+            mix = Mixture(np.ones(k)/k, samples[rng.choice(len(samples), k, replace=False)],
+                          np.repeat(base_cov[None, :, :], k, axis=0))
+            previous = -np.inf
+            converged = False
+            for iteration in range(500):
+                logs = mix.component_logpdf(samples) + np.log(mix.weights)
+                normalizer = logsumexp(logs, axis=1)
+                lower = normalizer.mean()
+                if abs(lower-previous) < 1e-5:
+                    converged = True
+                    break
+                previous = lower
+                responsibilities = np.exp(logs-normalizer[:, None])
+                counts = np.maximum(responsibilities.sum(axis=0), 1e-12)
+                means = responsibilities.T @ samples / counts[:, None]
+                covs = []
+                for component in range(k):
+                    d = samples-means[component]
+                    covs.append((d.T * responsibilities[:, component]) @ d / counts[component])
+                mix = Mixture(counts/counts.sum(), means, covs)
+            bic = -2*mix.logpdf(samples).sum() + (6*k-1)*np.log(len(samples))
+            records.append({"components": k, "restart": restart, "bic": float(bic),
+                            "em_iterations": iteration+1, "converged": converged})
+            if converged:
+                choices.append((bic, mix))
+    if not choices:
+        raise RuntimeError("GMM的EM未收敛，不能继续报告结果")
+    bic, mix = min(choices, key=lambda item: item[0])
+    return mix, {"gmm_components": 2, "selected_bic": None, "fixed_gmm_components": True,
+                 "em_trials": records}
+
+
+def fit_ce(model, rng, args, chain):
+    """MCMC初始化的CE-IS：共享失效链只用于初始提议，不计入本方法CPU。"""
+    mix = Mixture([1.0], [chain.mean(axis=0)], [regularize(np.cov(chain.T))])
+    thresholds = []
+    for _ in range(args.ce_iterations):
+        q = mix.defensive(args.defensive_weight)
+        z = q.sample(rng, args.ce_training)
+        g = model.latent_margin(z)
+        threshold = max(0.0, float(np.quantile(g, 0.1)))
+        elite = g <= threshold
+        logw = log_target(z[elite]) - q.logpdf(z[elite])
+        weights = np.exp(logw-logsumexp(logw))
+        mean = weights @ z[elite]
+        d = z[elite]-mean
+        cov = (d.T*weights) @ d
+        mean = 0.7*mean + 0.3*mix.means[0]
+        cov = 0.7*cov + 0.3*mix.covariances[0]
+        mix = Mixture([1.0], [mean], [cov])
+        thresholds.append(threshold)
+    return mix, {"ce_thresholds": thresholds, "ce_iterations": args.ce_iterations}
+
+
+def statistics_from_moments(total, total_sq, n):
+    """由累积贡献项计算普通IS估计量及其抽样标准误。"""
+    pf = total / n
+    variance = max(0.0, (total_sq - total * total / n) / max(1, n - 1))
+    se = np.sqrt(variance / n)
+    return {"failure_probability": float(pf), "reliability": float(1 - pf),
+            "standard_error": float(se), "estimator_cov": float(se / pf) if pf else None,
+            "ci95_low": float(max(0.0, pf - 1.96 * se)),
+            "ci95_high": float(min(1.0, pf + 1.96 * se))}
+
+
+def run_mcs(model, rng, n):
+    """按用户要求：一次性使用300万个原始Beta样本。"""
+    model.evaluations = 0
+    wall, cpu = time.perf_counter(), time.process_time()
+    offsets = -0.1 + 0.2 * rng.beta(2, 4, size=(n, 2))
+    values = (model.margin(offsets) < 0).astype(float)
+    total, total_sq = float(values.sum()), float(np.dot(values, values))
+    return {"method": "MCS", **statistics_from_moments(total, total_sq, n),
+            "n_training": 0, "n_estimation": n, "n_total_evaluations": model.evaluations,
+            "iterations": 1, "converged": True,
+            "cpu_seconds": time.process_time() - cpu, "wall_seconds": time.perf_counter() - wall,
+            "diagnostics": {}}, []
+
+
+def run_is_until_converged(name, model, rng, args, shared_chain, shared_diagnostics):
+    """构建一次提议分布，随后每轮加入固定的2,000个独立IS样本。
+
+    以相邻两次*累计*失效概率的相对变化判断。最少迭代次数、连续满足次数和
+    最大迭代次数均可配置，以防随机波动导致过早停止或无限循环。
+    """
+    model.evaluations = 0
+    wall, cpu = time.perf_counter(), time.process_time()
+    diagnostics = {"shared_mcmc": True, **shared_diagnostics}
+    if name in ("MIS", "MG-IS"):
+        if name == "MIS":
+            indices = np.linspace(0, len(shared_chain) - 1, min(args.mis_kernel_centers, len(shared_chain)), dtype=int)
+            means = shared_chain[indices]
+            mix = Mixture(np.ones(len(means)) / len(means), means,
+                          np.repeat((args.proposal_scale**2 * np.eye(2))[None, :, :], len(means), axis=0))
+            diagnostics["mis_kernel_centers"] = len(means)
+        else:
+            mix, gmm_details = fit_two_component_gmm(shared_chain, rng)
+            diagnostics.update(gmm_details)
+    elif name == "CE-IS":
+        mix, ce_diagnostics = fit_ce(model, rng, args, shared_chain)
+        diagnostics.update(ce_diagnostics)
+    else:
+        raise ValueError(name)
+    training_count = model.evaluations
+    proposal = mix.defensive(args.defensive_weight)
+    total = total_sq = 0.0
+    previous = None
+    consecutive = 0
+    history = []
+    for iteration in range(1, args.max_is_iterations + 1):
+        z = proposal.sample(rng, args.is_batch_size)
+        logw = log_target(z) - proposal.logpdf(z)
+        contribution = np.exp(logw) * (model.latent_margin(z) < 0)
+        total += float(contribution.sum())
+        total_sq += float(np.dot(contribution, contribution))
+        n = iteration * args.is_batch_size
+        stat = statistics_from_moments(total, total_sq, n)
+        relative_change = None if previous is None else abs(stat["failure_probability"] - previous) / max(abs(previous), 1e-15)
+        cov_satisfied = stat["estimator_cov"] is not None and stat["estimator_cov"] <= args.target_cov
+        if (iteration >= args.min_is_iterations and relative_change is not None
+                and relative_change < args.relative_tolerance and cov_satisfied):
+            consecutive += 1
+        else:
+            consecutive = 0
+        history.append({"method": name, "iteration": iteration, "n_estimation": n,
+                        "failure_probability": stat["failure_probability"],
+                        "standard_error": stat["standard_error"],
+                        "estimator_cov": stat["estimator_cov"],
+                        "relative_change": relative_change,
+                        "consecutive_small_changes": consecutive, "cov_satisfied": cov_satisfied})
+        previous = stat["failure_probability"]
+        if consecutive >= args.required_consecutive_changes:
+            break
+    converged = consecutive >= args.required_consecutive_changes
+    final = history[-1]
+    result = {"method": name, **statistics_from_moments(total, total_sq, n),
+              "n_training": training_count, "n_estimation": n,
+              "n_total_evaluations": model.evaluations, "iterations": iteration,
+              "converged": converged, "cpu_seconds": time.process_time() - cpu,
+              "wall_seconds": time.perf_counter() - wall, "diagnostics": diagnostics}
+    return result, history
+
+
+def save_outputs(rows, histories, model, args):
+    args.output.mkdir(parents=True, exist_ok=True)
+    fields = [key for key in rows[0] if key != "diagnostics"]
+    with (args.output / "comparison.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    history_fields = ["method", "iteration", "n_estimation", "failure_probability", "standard_error",
+                      "estimator_cov", "relative_change", "consecutive_small_changes", "cov_satisfied"]
+    with (args.output / "convergence_history.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=history_fields)
+        writer.writeheader()
+        for history in histories.values():
+            writer.writerows(history)
+    config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    config.update({"trajectory_sha256": hashlib.sha256(args.trajectory.read_bytes()).hexdigest(),
+                   "time_points": len(model.time), "failure_event": FAILURE_EVENT_DESCRIPTION,
+                   "uncertainty": UNCERTAINTY_DESCRIPTION,
+                   "convergence_rule": "Relative change of consecutive cumulative IS estimates below tolerance for the required consecutive iterations, and estimator CoV not above target_cov.",
+                   "timing_note": "Method CPU includes CE training, proposal construction and iterative IS estimation. The shared MCMC CPU is deliberately excluded and reported separately."})
+    (args.output / "details.json").write_text(json.dumps({"config": config, "results": rows,
+                                                            "diagnostics": {r["method"]: r["diagnostics"] for r in rows}}, indent=2), encoding="utf-8")
+    print("\nMethod    Pf          samples   converged  CPU(s)")
+    for row in rows:
+        print(f"{row['method']:8s}  {row['failure_probability']:.6f}  {row['n_estimation']:8d}"
+              f"  {str(row['converged']):>9s}  {row['cpu_seconds']:.3f}")
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for name, history in histories.items():
+        if history:
+            ax.plot([x["n_estimation"] for x in history], [x["failure_probability"] for x in history],
+                    marker="o", markersize=3, label=name)
+    ax.axhline(rows[0]["failure_probability"], color="black", linestyle="--", linewidth=1, label="MCS")
+    ax.set(xlabel="Cumulative importance samples", ylabel="Estimated failure probability",
+           title="IS convergence with 2,000 samples per iteration")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(args.output / "convergence.png", dpi=200)
+    plt.close(fig)
+
+
+def save_robustly_safe_result(model, args, minimum_distance, guaranteed_clearance):
+    """保存由有界初始位置误差直接证明的零失效概率结论。
+
+    此时不存在失效样本，MCMC/MIS/MG-IS不能初始化；不以虚构样本给出IS结果。
+    """
+    args.output.mkdir(parents=True, exist_ok=True)
+    result = {
+        "status": "robustly_safe_under_specified_uncertainty",
+        "failure_probability": 0.0,
+        "reliability": 1.0,
+        "physical_obstacle_radius": PHYSICAL_RADIUS,
+        "minimum_nominal_distance_to_center": minimum_distance,
+        "maximum_initial_position_shift": float(np.sqrt(2) * 0.1),
+        "guaranteed_minimum_clearance": guaranteed_clearance,
+        "reason": "The initial offsets are bounded in [-0.1, 0.1]^2, so every perturbed trajectory remains outside the physical obstacle.",
+        "method_note": "MCS, MIS, CE-IS and MG-IS comparison is not applicable because the failure domain is empty under the specified uncertainty."
+    }
+    (args.output / "robust_safety_result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    with (args.output / "comparison.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["method", "failure_probability", "reliability", "status"])
+        writer.writeheader()
+        writer.writerow({"method": "Analytical bounded-uncertainty check", "failure_probability": 0.0,
+                         "reliability": 1.0, "status": result["status"]})
+    print("Failure domain is empty under the specified bounded uncertainty.")
+    print("Pf = 0 exactly; MCMC/MIS/CE-IS/MG-IS comparison is not applicable.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--trajectory", type=Path,
+                        default=HERE/"vehicle_deterministic_results_design_1p0"/"trajectory.npz")
+    parser.add_argument("--output", type=Path, default=HERE/"vehicle_reliability_results_batch5000_strict_5runs")
+    parser.add_argument("--seed", type=int, default=20261002)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--reuse-mcs-from", type=Path, default=None,
+                        help="Reuse the corresponding MCS result from each run_NN/details.json")
+    parser.add_argument("--mcs-samples", type=int, default=3000000)
+    parser.add_argument("--chain-steps", type=int, default=8000)
+    parser.add_argument("--proposal-scale", type=float, default=0.65)
+    parser.add_argument("--mis-kernel-centers", type=int, default=200)
+    parser.add_argument("--ce-training", type=int, default=2000)
+    parser.add_argument("--ce-iterations", type=int, default=4)
+    parser.add_argument("--defensive-weight", type=float, default=0.05)
+    parser.add_argument("--is-batch-size", type=int, default=5000)
+    parser.add_argument("--min-is-iterations", type=int, default=5)
+    parser.add_argument("--relative-tolerance", type=float, default=1e-4)
+    parser.add_argument("--required-consecutive-changes", type=int, default=2)
+    parser.add_argument("--target-cov", type=float, default=0.0006,
+                        help="IS累计估计的目标变异系数；0.0006表示0.06%%")
+    parser.add_argument("--max-is-iterations", type=int, default=1000)
+    args = parser.parse_args()
+    if (args.repeats < 1 or args.mcs_samples < 2 or args.chain_steps < 100 or args.proposal_scale <= 0
+            or args.mis_kernel_centers < 1 or args.ce_training < 100 or args.ce_iterations < 1
+            or args.is_batch_size < 2 or args.min_is_iterations < 2 or args.required_consecutive_changes < 1
+            or args.max_is_iterations < args.min_is_iterations or args.relative_tolerance <= 0
+            or args.target_cov <= 0
+            or not 0 <= args.defensive_weight < 1):
+        parser.error("请检查样本数、链长度、分量数、提议尺度和混合权重")
+    model = FailureModel(args.trajectory)
+    nominal_g = model.margin([[0, 0]])[0]
+    if nominal_g < -1e-8:
+        raise ValueError("加载的名义轨迹本身已发生碰撞")
+    minimum_distance = float(np.sqrt(np.min(model.squared)))
+    guaranteed_clearance = minimum_distance - np.sqrt(2) * 0.1 - PHYSICAL_RADIUS
+    if guaranteed_clearance > 0:
+        save_robustly_safe_result(model, args, minimum_distance, guaranteed_clearance)
+        return
+    output_root = args.output
+    all_rows = []
+    mcmc_rows = []
+    for repeat, repeat_seed in enumerate(np.random.SeedSequence(args.seed).spawn(args.repeats), start=1):
+        seeds = repeat_seed.spawn(5)
+        if args.reuse_mcs_from is None:
+            print(f"\nRun {repeat}/{args.repeats}: MCS with {args.mcs_samples:,} samples", flush=True)
+            mcs, _ = run_mcs(model, np.random.default_rng(seeds[0]), args.mcs_samples)
+        else:
+            source = args.reuse_mcs_from / f"run_{repeat:02d}" / "details.json"
+            previous = json.loads(source.read_text(encoding="utf-8"))
+            if (previous["config"]["trajectory_sha256"] != hashlib.sha256(args.trajectory.read_bytes()).hexdigest()
+                    or int(previous["config"]["mcs_samples"]) != args.mcs_samples
+                    or int(previous["config"]["seed"]) != args.seed):
+                raise ValueError(f"MCS source settings differ: {source}")
+            mcs = next(row for row in previous["results"] if row["method"] == "MCS")
+            print(f"\nRun {repeat}/{args.repeats}: reusing MCS result from {source}", flush=True)
+        rows = [mcs]
+        histories = {}
+        # 每次独立生成一条链，供该次的三种IS方法共用；链的开销单列。
+        model.evaluations = 0
+        shared_wall, shared_cpu = time.perf_counter(), time.process_time()
+        shared_chain, shared_diagnostics = failure_chain(
+            model, np.random.default_rng(seeds[1]), args.chain_steps, args.proposal_scale
+        )
+        shared_mcmc = {"repeat": repeat, **shared_diagnostics,
+                       "cpu_seconds_excluded": time.process_time() - shared_cpu,
+                       "wall_seconds_excluded": time.perf_counter() - shared_wall,
+                       "model_evaluations_excluded": model.evaluations}
+        mcmc_rows.append(shared_mcmc)
+        print(f"  Shared MCMC: {len(shared_chain)} failure samples; "
+              f"CPU {shared_mcmc['cpu_seconds_excluded']:.3f}s excluded", flush=True)
+        for index, name in enumerate(("MIS", "CE-IS", "MG-IS"), start=1):
+            row, history = run_is_until_converged(
+                name, model, np.random.default_rng(seeds[index + 1]), args, shared_chain, shared_diagnostics
+            )
+            rows.append(row)
+            histories[name] = history
+            print(f"  {name}: Pf={row['failure_probability']:.6f}, "
+                  f"samples={row['n_estimation']}, converged={row['converged']}, "
+                  f"CPU={row['cpu_seconds']:.3f}s", flush=True)
+        args.output = output_root / f"run_{repeat:02d}"
+        save_outputs(rows, histories, model, args)
+        details_path = args.output / "details.json"
+        details = json.loads(details_path.read_text(encoding="utf-8"))
+        details["shared_mcmc_excluded_from_is_cpu"] = shared_mcmc
+        details_path.write_text(json.dumps(details, indent=2), encoding="utf-8")
+        all_rows.extend({"repeat": repeat, **row} for row in rows)
+    args.output = output_root
+    fields = ["repeat"] + [key for key in all_rows[0] if key not in ("repeat", "diagnostics")]
+    with (output_root / "all_runs.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(all_rows)
+    summary = []
+    for name in ("MCS", "MIS", "CE-IS", "MG-IS"):
+        group = [row for row in all_rows if row["method"] == name]
+        summary.append({"method": name, "runs": len(group),
+                        "converged_runs": sum(bool(row["converged"]) for row in group),
+                        "mean_failure_probability": float(np.mean([row["failure_probability"] for row in group])),
+                        "sd_failure_probability": float(np.std([row["failure_probability"] for row in group], ddof=1)) if len(group) > 1 else 0.0,
+                        "mean_estimation_samples": float(np.mean([row["n_estimation"] for row in group])),
+                        "mean_training_samples": float(np.mean([row["n_training"] for row in group])),
+                        "mean_total_evaluations": float(np.mean([row["n_total_evaluations"] for row in group])),
+                        "mean_cpu_seconds": float(np.mean([row["cpu_seconds"] for row in group])),
+                        "mean_wall_seconds": float(np.mean([row["wall_seconds"] for row in group]))})
+    with (output_root / "summary.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(summary[0]))
+        writer.writeheader()
+        writer.writerows(summary)
+    (output_root / "summary.json").write_text(json.dumps({"summary": summary, "shared_mcmc": mcmc_rows,
+        "mean_shared_mcmc_cpu_seconds_excluded": float(np.mean([r["cpu_seconds_excluded"] for r in mcmc_rows]))},
+        indent=2), encoding="utf-8")
+    print("\nFive-run averages:", flush=True)
+    for row in summary:
+        print(f"{row['method']:8s} Pf={row['mean_failure_probability']:.6f}, "
+              f"samples={row['mean_estimation_samples']:.0f}, "
+              f"CPU={row['mean_cpu_seconds']:.3f}s, "
+              f"converged={row['converged_runs']}/{row['runs']}", flush=True)
+    print(f"Results: {args.output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()

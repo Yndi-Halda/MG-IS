@@ -1,0 +1,77 @@
+import sys
+from pathlib import Path
+import numpy as np
+import vehicle_reliability as vr
+
+HERE = Path(__file__).resolve().parent
+GRID_STRIDE = 2
+
+
+class AircraftFailureModel:
+    def __init__(self, path):
+        with np.load(path, allow_pickle=False) as saved:
+            self.time = saved['time'][::GRID_STRIDE].copy()
+            self.position = saved['position'][::GRID_STRIDE, :2].copy()
+        self.relative = self.position - np.array([4., 5.])
+        self.squared = np.sum(self.relative**2, axis=1)
+        self.shift = 0.5 * self.time**2
+        self.evaluations = 0
+
+    def margin(self, wind):
+        wind = np.atleast_2d(wind)
+        self.evaluations += len(wind)
+        result = np.empty(len(wind))
+        for first in range(0, len(wind), 2048):
+            w = wind[first:first+2048]
+            x = self.relative[:,0][None,:] + w[:,0,None]*self.shift[None,:]
+            y = self.relative[:,1][None,:] + w[:,1,None]*self.shift[None,:]
+            result[first:first+len(w)] = np.min(x*x+y*y-4,axis=1)
+        return result
+
+    def latent_margin(self, z):
+        return self.margin(0.02*np.asarray(z))
+
+
+def aircraft_mcs(model, rng, n):
+    import time
+    model.evaluations = 0
+    start_wall, start_cpu = time.perf_counter(), time.process_time()
+    total = 0
+    for first in range(0, n, 20000):
+        count = min(20000, n-first)
+        total += int(np.count_nonzero(model.margin(rng.normal(0,0.02,(count,2))) < 0))
+    result = {'method':'MCS', **vr.statistics_from_moments(total,total,n),
+              'n_training':0,'n_estimation':n,'n_total_evaluations':model.evaluations,
+              'iterations':1,'converged':True,
+              'cpu_seconds':time.process_time()-start_cpu,
+              'wall_seconds':time.perf_counter()-start_wall,'diagnostics':{}}
+    return result, []
+
+
+vr.FailureModel = AircraftFailureModel
+vr.run_mcs = aircraft_mcs
+vr.PHYSICAL_RADIUS = 2.0
+vr.HERE = HERE
+vr.UNCERTAINTY_DESCRIPTION = 'independent wx, wy, wz ~ N(0, 0.02^2); constant in time; wz integrates out of cylinder event'
+vr.FAILURE_EVENT_DESCRIPTION = 'minimum sampled-time cylinder clearance (x-4)^2+(y-5)^2-4 < 0'
+
+if __name__ == '__main__':
+    if '--grid-stride' in sys.argv:
+        index = sys.argv.index('--grid-stride')
+        GRID_STRIDE = int(sys.argv[index + 1])
+        del sys.argv[index:index + 2]
+    if GRID_STRIDE < 1:
+        raise ValueError('grid stride must be positive')
+    if '--trajectory' not in sys.argv:
+        sys.argv += ['--trajectory', str(HERE/'aircraft_deterministic_trajectory.npz')]
+    if '--output' not in sys.argv:
+        sys.argv += ['--output', str(HERE/'aircraft_reliability_results_grid1001_batch5000_5runs')]
+    if '--mcs-samples' not in sys.argv:
+        sys.argv += ['--mcs-samples', '3000000']
+    if '--relative-tolerance' not in sys.argv:
+        sys.argv += ['--relative-tolerance', '0.0005']
+    if '--target-cov' not in sys.argv:
+        sys.argv += ['--target-cov', '0.001']
+    if '--is-batch-size' not in sys.argv:
+        sys.argv += ['--is-batch-size', '5000']
+    vr.main()

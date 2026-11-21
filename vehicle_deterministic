@@ -1,0 +1,178 @@
+from pathlib import Path
+import argparse
+import json
+import numpy as np
+from scipy.optimize import minimize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+START = np.array([0.0, 0.0])
+TARGET = np.array([3.0, 3.0])
+CENTER = np.array([1.4, 1.5])
+PHYSICAL_RADIUS = 1.0
+
+def position_matrix(t, tf, n):
+    """消去自由初速度，使终点位置严格满足要求：p(t)=直线+B(t)u。"""
+    t = np.asarray(t).reshape(-1, 1)
+    edges = np.linspace(0.0, tf, n + 1)
+    dt = tf / n
+    end_response = dt * (tf - (edges[:-1] + edges[1:]) / 2)
+    response = 0.5 * (np.maximum(t - edges[:-1], 0)**2
+                      - np.maximum(t - edges[1:], 0)**2)
+    return response - t / tf * end_response
+
+
+def states(t, u, tf):
+    n = len(u)
+    t = np.asarray(t)
+    edges = np.linspace(0.0, tf, n + 1)
+    dt = tf / n
+    v0 = (TARGET - START - (dt * (tf - (edges[:-1] + edges[1:]) / 2)) @ u) / tf
+    p = START + t[:, None] / tf * (TARGET - START) + position_matrix(t, tf, n) @ u
+    v = v0 + np.clip(t[:, None] - edges[:-1], 0, dt) @ u
+    return p, v
+
+
+def interval_extrema(u, tf, design_radius):
+    """对每段二次轨迹求精确极值位置，检查节点之间的碰撞和越界。
+
+    距离平方的导数是三次多项式；各坐标极值由速度为零确定。
+    """
+    n = len(u)
+    dt = tf / n
+    nodes = np.linspace(0, tf, n + 1)
+    p, v = states(nodes, u, tf)
+    times = list(nodes)
+    for k in range(n):
+        r, w, a = p[k] - CENTER, v[k], u[k]
+        coefficients = [r @ w, w @ w + r @ a, 1.5 * w @ a, 0.5 * (a @ a)]
+        roots = np.polynomial.polynomial.polyroots(coefficients)
+        for root in roots:
+            if abs(root.imag) < 1e-8 and 0 < root.real < dt:
+                times.append(nodes[k] + root.real)
+        for j in range(2):
+            if abs(a[j]) > 1e-14:
+                tau = -w[j] / a[j]
+                if 0 < tau < dt:
+                    times.append(nodes[k] + tau)
+    times = np.unique(times)
+    p, _ = states(times, u, tf)
+    margins = np.sum((p - CENTER)**2, axis=1) - design_radius**2
+    violation = (margins < 0.0) | np.any((p < -1e-8) | (p > 5 + 1e-8), axis=1)
+    return times, margins, p, times[violation]
+
+
+def solve(tf=6.0, n=60, design_radius=PHYSICAL_RADIUS):
+    dt = tf / n
+    candidates = []
+    for side in (1, -1):
+        # 两个初值分别向右下和左上绕行；不限制最终解必须单调前进。
+        mid = (np.arange(n) + 0.5) * dt
+        normal = side * np.array([1.0, -1.0]) / np.sqrt(2)
+        u = (-1.3 * (np.pi / tf)**2 * np.sin(np.pi * mid / tf))[:, None] * normal
+        sample_times = np.linspace(0, tf, 5 * n + 1)
+        converged = False
+        for refinement in range(8):
+            b = position_matrix(sample_times, tf, n)
+            base = START + sample_times[:, None] / tf * (TARGET - START)
+            # 决策向量次序：u1[0],u2[0],u1[1],u2[1],...
+            dpx = np.zeros((len(sample_times), 2 * n))
+            dpy = np.zeros_like(dpx)
+            dpx[:, 0::2], dpy[:, 1::2] = b, b
+
+            def objective(z):
+                return dt * np.dot(z, z)
+
+            def objective_jac(z):
+                return 2 * dt * z
+
+            def constraints(z):
+                p = base + b @ z.reshape(n, 2)
+                g = np.sum((p - CENTER)**2, axis=1) - design_radius**2
+                # 1e-7平方米仅为数值缓冲，不是可靠性优化的安全裕度。
+                return np.concatenate([g - 1e-7, p[:, 0], 5 - p[:, 0], p[:, 1], 5 - p[:, 1]])
+
+            def constraint_jac(z):
+                r = base + b @ z.reshape(n, 2) - CENTER
+                dg = 2 * r[:, 0, None] * dpx + 2 * r[:, 1, None] * dpy
+                return np.vstack([dg, dpx, -dpx, dpy, -dpy])
+
+            result = minimize(objective, u.ravel(), jac=objective_jac,
+                              method="SLSQP",
+                              constraints={"type": "ineq", "fun": constraints, "jac": constraint_jac},
+                              options={"ftol": 1e-11, "maxiter": 1500})
+            u = result.x.reshape(n, 2)
+            _, margins, positions, bad_times = interval_extrema(u, tf, design_radius)
+            if result.success and len(bad_times) == 0:
+                converged = True
+                break
+            if not result.success:
+                break
+            # 把连续时间检查发现的违规极值点加入约束，再求解。
+            sample_times = np.unique(np.r_[sample_times, bad_times])
+        print(f"side={side:+d}, success={converged}, J={result.fun:.10f}, "
+              f"min_margin={margins.min():.3e}, {result.message}")
+        if converged:
+            candidates.append((result.fun, u.copy(), side, float(margins.min())))
+    if not candidates:
+        raise RuntimeError("未找到通过连续时间约束检查的解；请调整离散区间数或初值。")
+    return min(candidates, key=lambda item: item[0])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tf", type=float, default=6.0, help="固定终止时间（论文未给数值）")
+    parser.add_argument("--intervals", type=int, default=60)
+    parser.add_argument("--design-obstacle-radius", type=float, default=PHYSICAL_RADIUS,
+                        help="确定性优化使用的障碍物半径；可靠性物理判据仍为1.0 m")
+    parser.add_argument("--output", type=Path,
+                        default=Path(__file__).parent / "vehicle_deterministic_results_design_1p0")
+    args = parser.parse_args()
+    if args.tf <= 0 or args.intervals < 4 or args.design_obstacle_radius < PHYSICAL_RADIUS:
+        parser.error("tf必须为正数，intervals至少为4，设计半径不得小于物理半径1.0 m")
+    j, u, side, margin = solve(args.tf, args.intervals, args.design_obstacle_radius)
+    t = np.linspace(0, args.tf, 2001)
+    p, v = states(t, u, args.tf)
+    boundary_error = float(max(np.max(abs(p[0] - START)), np.max(abs(p[-1] - TARGET))))
+    if boundary_error > 1e-8:
+        raise RuntimeError("端点位置检查失败")
+    args.output.mkdir(parents=True, exist_ok=True)
+    np.savez(args.output / "trajectory.npz", time=t, position=p, velocity=v,
+             control=u, control_edges=np.linspace(0, args.tf, args.intervals + 1), objective=j)
+    sampled_u = u[np.minimum((t / (args.tf / args.intervals)).astype(int), args.intervals - 1)]
+    np.savetxt(args.output / "trajectory.csv", np.column_stack([t, p, v, sampled_u]),
+               delimiter=",", header="time,x,y,vx,vy,u1,u2", comments="")
+    summary = {"final_time_assumption": args.tf, "intervals": args.intervals,
+               "objective_J": float(j), "chosen_initial_side": side,
+               "minimum_continuous_squared_margin": margin,
+               "design_obstacle_radius": args.design_obstacle_radius,
+               "physical_obstacle_radius": PHYSICAL_RADIUS,
+               "minimum_clearance_to_design_boundary": float(np.sqrt(args.design_obstacle_radius**2 + margin) - args.design_obstacle_radius),
+               "minimum_clearance_to_physical_obstacle": float(np.sqrt(args.design_obstacle_radius**2 + margin) - PHYSICAL_RADIUS),
+               "endpoint_error": boundary_error,
+               "initial_velocity": v[0].tolist(), "final_velocity": v[-1].tolist(),
+               "note": "Best feasible local solution from two initial paths; not a global optimality certificate."}
+    (args.output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    ax.add_patch(plt.Circle(CENTER, PHYSICAL_RADIUS, facecolor="#fff3a3", edgecolor="#cbb900", label="Physical obstacle"))
+    if args.design_obstacle_radius > PHYSICAL_RADIUS:
+        ax.add_patch(plt.Circle(CENTER, args.design_obstacle_radius, fill=False, linestyle="--",
+                                linewidth=1.5, edgecolor="darkorange", label="Design avoidance boundary"))
+    ax.plot(p[:, 0], p[:, 1], "b--", lw=2, label="Optimized trajectory")
+    ax.scatter(*START, color="green", s=55, label="Start", zorder=4)
+    ax.scatter(*TARGET, color="red", marker="*", s=110, label="Target", zorder=4)
+    ax.set(xlabel="x (m)", ylabel="y (m)", xlim=(-0.3, 3.5), ylim=(-0.3, 3.5),
+           title=f"Deterministic optimization: T={args.tf:g} s, J={j:.6f}")
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(args.output / "trajectory.png", dpi=200)
+    plt.close(fig)
+    print(json.dumps(summary, indent=2))
+    print(f"Output: {args.output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()

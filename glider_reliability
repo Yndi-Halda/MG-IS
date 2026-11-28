@@ -1,5 +1,9 @@
 """Reliability comparison for the 720-ft GPOPS-II glider trajectory.
 
+CD0 ~ N(0.00873, 0.002**2), fixed controls, failure=max altitude > 720 m.
+The ODE response is monotone over mean +/- 4 sigma; find the critical CD0
+with ODE solves, then use the equivalent one-dimensional event for all methods.
+MCS, MIS, CE-IS and two-component MG-IS use the same failure indicator.
 """
 import argparse,csv,json,time
 from pathlib import Path
@@ -93,8 +97,19 @@ def run_is(name,chain,rng,zcrit,batch,tol,cov_target,max_iterations=1000):
             if len(elite)>20:mean,sd=np.mean(elite),max(.2,np.std(elite))
         proposal=Proposal([1.],[mean],[sd]);training=8000
     else:
-        proposal=fit_gmm2(chain,rng);training=0
-    proposal=proposal.defensive(.05)
+        fitted=fit_gmm2(chain,rng)
+        # Use an independent pilot to estimate the second moment of IS contributions.
+        # A shared pilot distribution makes the scores comparable across candidates.
+        pilot=fitted.defensive(.05)
+        draws=pilot.sample(rng,20000)
+        failed=draws[draws<zcrit]
+        log_numerator=2*lognormal(failed)-pilot.logpdf(failed)
+        candidates=[Proposal(fitted.weights,fitted.means,fitted.sds*factor).defensive(.05)
+                    for factor in (.8,1.,1.2,1.5,2.)]
+        proposal=min(candidates,key=lambda q: logsumexp(log_numerator-q.logpdf(failed)))
+        training=len(draws)
+    if name!='MG-IS':
+        proposal=proposal.defensive(.05)
     total=total_sq=0.;previous=None;consecutive=0
     for iteration in range(1,max_iterations+1):
         z=proposal.sample(rng,batch)
@@ -143,11 +158,15 @@ def main():
     with (args.output/'all_runs.csv').open('w',newline='',encoding='utf-8-sig') as f:
         w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
     summary=[]
+    mcs_mean=np.mean([r['pf'] for r in rows if r['method']=='MCS'])
     for name in ('MCS','MIS','CE-IS','MG-IS'):
         group=[r for r in rows if r['method']==name]
         summary.append({'method':name,'mean_pf':float(np.mean([r['pf'] for r in group])),
                         'mean_abs_error_vs_exact':float(np.mean([abs(r['pf']-exact) for r in group])),
+                        'rmse_vs_reference':float(np.sqrt(np.mean([(r['pf']-exact)**2 for r in group]))),
+                        'absolute_difference_from_mcs_mean':float(abs(np.mean([r['pf'] for r in group])-mcs_mean)),
                         'mean_samples':float(np.mean([r['n_estimation'] for r in group])),
+                        'mean_training_samples':float(np.mean([r['n_training'] for r in group])),
                         'mean_cpu_seconds':float(np.mean([r['cpu_seconds'] for r in group])),
                         'converged_runs':sum(r['converged'] for r in group)})
     with (args.output/'summary.csv').open('w',newline='',encoding='utf-8-sig') as f:
